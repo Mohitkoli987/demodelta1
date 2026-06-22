@@ -88,6 +88,28 @@ LAST_SAVED_TRADE_KEY = None
 #
 # blocking=True means if all pooled connections are busy, a caller will WAIT
 # for one to free up instead of opening a new one / failing immediately.
+# MYSQL_POOL = PooledDB(
+#     creator=pymysql,
+#     maxconnections=4,       # stay safely under server limit of 5
+#     mincached=1,
+#     maxcached=4,
+#     maxshared=0,
+#     blocking=True,          # wait for a free connection instead of erroring
+#     maxusage=None,          # recycle connection indefinitely (no forced close after N uses)
+#     setsession=[],
+#     ping=1,                 # ping connection before use; reconnect if stale (fixes "Lost connection")
+#     host=os.getenv('MYSQL_HOST', 'bmh1rsh5f0sjmncv6ydc-mysql.services.clever-cloud.com'),
+#     port=int(os.getenv('MYSQL_PORT', 3306)),
+#     user=os.getenv('MYSQL_USER', 'ujokhsx1defubkot'),
+#     password=os.getenv('MYSQL_PASSWORD', 'hILZGFpJ60exq4oGj2hv'),
+#     database=os.getenv('MYSQL_DB', 'bmh1rsh5f0sjmncv6ydc'),
+#     charset='utf8mb4',
+#     cursorclass=pymysql.cursors.DictCursor,
+#     autocommit=False,
+#     ssl={}
+# )
+
+
 MYSQL_POOL = PooledDB(
     creator=pymysql,
     maxconnections=4,       # stay safely under server limit of 5
@@ -98,11 +120,11 @@ MYSQL_POOL = PooledDB(
     maxusage=None,          # recycle connection indefinitely (no forced close after N uses)
     setsession=[],
     ping=1,                 # ping connection before use; reconnect if stale (fixes "Lost connection")
-    host=os.getenv('MYSQL_HOST', 'bmh1rsh5f0sjmncv6ydc-mysql.services.clever-cloud.com'),
+    host=os.getenv('MYSQL_HOST', 'btuqjkw57smu3ay53y76-mysql.services.clever-cloud.com'),
     port=int(os.getenv('MYSQL_PORT', 3306)),
-    user=os.getenv('MYSQL_USER', 'ujokhsx1defubkot'),
-    password=os.getenv('MYSQL_PASSWORD', 'hILZGFpJ60exq4oGj2hv'),
-    database=os.getenv('MYSQL_DB', 'bmh1rsh5f0sjmncv6ydc'),
+    user=os.getenv('MYSQL_USER', 'usvfl3sts8yklxnk'),
+    password=os.getenv('MYSQL_PASSWORD', 'NkYQWQDHcUdXV3TuAFzj'),
+    database=os.getenv('MYSQL_DB', 'btuqjkw57smu3ay53y76'),
     charset='utf8mb4',
     cursorclass=pymysql.cursors.DictCursor,
     autocommit=False,
@@ -189,6 +211,8 @@ def cleanup_old_trades(target_size_mb=8.5):
 BASE_URL = "https://cdn-ind.testnet.deltaex.org"
 WS_URL ="wss://testnet-socket.india.delta.exchange"
 
+fees=2
+
 
 DELTA_API_KEY = os.getenv("DELTA_API_KEY")
 DELTA_API_SECRET = os.getenv("DELTA_API_SECRET")
@@ -247,6 +271,14 @@ LAST_PROCESSED_TRADE_ID = None
 
 USED_FILL_IDS = set()
 USED_FILL_IDS_LOCK = Lock()
+
+# ========== MARK PRICE CACHE ==========
+MARK_PRICES      = {}
+MARK_PRICES_LOCK = Lock()
+
+# _break_even_applied_lock ADD karo
+_break_even_applied      = {}
+_break_even_applied_lock = Lock()
 
 PROCESSED_ORDER_IDS = set()
 PROCESSED_ORDER_IDS_LOCK = Lock()
@@ -813,9 +845,9 @@ def pre_order_fill_verification(symbol, wait_seconds=15):
             actual_quantity = lot_size * lot_multiplier
  
             if entry_side == 'buy':
-                pnl = (exit_price - entry_price) * actual_quantity
+                pnl = (exit_price - (entry_price + fees)) * actual_quantity 
             else:
-                pnl = (entry_price - exit_price) * actual_quantity
+                pnl = ((entry_price - fees) - exit_price) * actual_quantity 
  
             result['lot_used']   = lot_size
             result['pnl']        = pnl
@@ -1797,9 +1829,9 @@ def find_trade_by_order_id(symbol, target_order_id):
     actual_quantity = trade_size * lot_size
 
     if entry_side == 'buy':
-        pnl = (exit_price - entry_price) * actual_quantity
+        pnl = (exit_price - (entry_price + fees)) * actual_quantity 
     else:
-        pnl = (entry_price - exit_price) * actual_quantity
+        pnl = ((entry_price - fees ) - exit_price) * actual_quantity 
 
     entry_exit_data = {
         'side':           entry_side,
@@ -2329,14 +2361,32 @@ def _ws_on_message(ws, message):
         msg      = json.loads(message)
         msg_type = msg.get('type', '')
 
+        # ── Auth ──────────────────────────────────────────────────────
         if msg_type == 'success' and msg.get('message') == 'Authenticated':
             WS_AUTHENTICATED = True
             print("[WS] Authenticated successfully")
             symbol = BOT_STATE.get('symbol', 'ETHUSD')
+
+            # Private channels
             _ws_subscribe(ws, 'v2/user_trades', [symbol])
             _ws_subscribe(ws, 'positions',      [symbol])
+
+            # Mark price channel (public)
+            mark_symbol = f"MARK:{symbol}"
+            _ws_subscribe(ws, 'mark_price', [mark_symbol])
             return
 
+        # ── Mark price update ─────────────────────────────────────────
+        if msg_type == 'mark_price':
+            raw_sym = msg.get('symbol', '')        # e.g. "MARK:ETHUSD"
+            sym     = raw_sym.replace('MARK:', '') # → "ETHUSD"
+            price   = msg.get('price') or msg.get('mark_price')
+            if sym and price:
+                with MARK_PRICES_LOCK:
+                    MARK_PRICES[sym] = float(price)
+            return
+
+        # ── Fill ──────────────────────────────────────────────────────
         if msg_type == 'v2/user_trades':
             fill = {
                 'fill_id':             msg.get('f'),
@@ -2358,6 +2408,7 @@ def _ws_on_message(ws, message):
                   f"| order_id={fill['order_id']}")
             return
 
+        # ── Position snapshot / update ────────────────────────────────
         if msg_type == 'positions':
             action = msg.get('action', '')
             if action == 'snapshot':
@@ -2391,7 +2442,6 @@ def _ws_on_message(ws, message):
 
     except Exception as e:
         print(f"[WS] on_message error: {e}")
-
 
 def _ws_on_error(ws, error):
     print(f"[WS] Error: {error}")
@@ -2542,9 +2592,9 @@ def _pair_ws_fills(fills, symbol):
         actual_quantity = trade_size * lot_size
 
         if entry_side == 'buy':
-            pnl = (exit_price - entry_price) * actual_quantity
+            pnl = (exit_price - (entry_price + fees)) * actual_quantity 
         else:
-            pnl = (entry_price - exit_price) * actual_quantity
+            pnl = ((entry_price - fees) - exit_price) * actual_quantity 
 
         entry_ts_iso = datetime.utcfromtimestamp(entry_order['timestamp_us'] / 1_000_000).isoformat() + 'Z'
         exit_ts_iso  = datetime.utcfromtimestamp(exit_order['timestamp_us'] / 1_000_000).isoformat() + 'Z'
@@ -2599,9 +2649,9 @@ def _pair_ws_fills(fills, symbol):
             actual_quantity = trade_size * lot_size
 
             if entry_side == 'buy':
-                pnl = (exit_price - entry_price) * actual_quantity
+                pnl = (exit_price - (entry_price + fees)) * actual_quantity 
             else:
-                pnl = (entry_price - exit_price) * actual_quantity
+                pnl = ((entry_price - fees) - exit_price) * actual_quantity 
 
             entry_ts_iso = datetime.utcfromtimestamp(entry_order['timestamp_us'] / 1_000_000).isoformat() + 'Z'
             exit_ts_iso  = datetime.utcfromtimestamp(exit_order['timestamp_us'] / 1_000_000).isoformat() + 'Z'
@@ -3714,48 +3764,72 @@ def delete_trades():
 
 
 # ========== TP/SL GUARDIAN CONFIG ==========
-LIVE_TP_PERCENTAGE        = 8
-LIVE_SL_PERCENTAGE        = 4
+LIVE_TP_PERCENTAGE        = 0.5
+LIVE_SL_PERCENTAGE        = 0.5
 LIQUIDATION_PROTECTION    = "Y"
-LIQUIDATION_BUFFER        = 0.15
+# LIQUIDATION_BUFFER        = 0.15
+LIQUIDATION_BUFFER        = 0.1
 
+# ========== BREAK-EVEN CONFIG ==========
+BREAK_EVEN_ENABLED        = True
+BREAK_EVEN_TRIGGER_PERCENT = 0.5    # TP ka kitna % travel hone pe BE activate ho
+BREAK_EVEN_TRIGGER_BUFFER  = 0.4    # Half-TP se itna pehle trigger ho (USD)
+BREAK_EVEN_PROFIT_OFFSET   = 2    # Entry ke upar SL kitna rakho (USD)
 
+# ========== BREAK-EVEN STATE TRACKER ==========
+# key = product_id, value = True/False
+_break_even_applied = {}
+
+# ========== TP/SL GUARDIAN (with real-time mark price) ==========
 def auto_tp_sl_guardian():
     while True:
         try:
             time.sleep(2)
-
+ 
             positions_response = make_api_request('GET', '/positions/margined')
             if not positions_response or not positions_response.get('success'):
                 continue
-
+ 
             active_positions = [
                 p for p in positions_response.get('result', [])
                 if abs(float(p.get('size', 0))) > 0.0001
             ]
-
+ 
             if not active_positions:
+                # Clean up BE tracker when no positions open
+                with _break_even_applied_lock:
+                    _break_even_applied.clear()
                 continue
-
+ 
+            # Clean up closed positions from tracker
+            active_ids = set(str(p.get('product_id')) for p in active_positions)
+            with _break_even_applied_lock:
+                for pid in list(_break_even_applied.keys()):
+                    if pid not in active_ids:
+                        del _break_even_applied[pid]
+ 
             for pos in active_positions:
                 try:
                     symbol     = pos.get("product_symbol") or pos.get("symbol")
                     size       = float(pos.get("size", 0))
                     entry      = float(pos.get("entry_price", 0))
                     product_id = pos.get("product_id")
-
+ 
                     if not all([symbol, product_id]) or abs(size) < 0.0001 or entry <= 0:
                         continue
-
+ 
+                    pos_key = str(product_id)
+ 
                     if size > 0:
                         expected_tp = entry * (1 + LIVE_TP_PERCENTAGE / 100)
                         expected_sl = entry * (1 - LIVE_SL_PERCENTAGE / 100)
                     else:
                         expected_tp = entry * (1 - LIVE_TP_PERCENTAGE / 100)
                         expected_sl = entry * (1 + LIVE_SL_PERCENTAGE / 100)
-
+ 
                     final_sl = expected_sl
-
+ 
+                    # ── Liquidation protection ────────────────────────────
                     if str(LIQUIDATION_PROTECTION).strip().upper() == "Y":
                         try:
                             liquidation_price_raw = pos.get("liquidation_price")
@@ -3782,39 +3856,97 @@ def auto_tp_sl_guardian():
                         except Exception as liq_err:
                             log_system(f"[LIQ PROTECT] Error for {symbol}: {liq_err} - using original SL")
                             final_sl = expected_sl
-
+ 
+                    # ── BREAK-EVEN LOGIC (real-time mark price) ───────────
+                    with _break_even_applied_lock:
+                        be_already_done = _break_even_applied.get(pos_key, False)
+ 
+                    if BREAK_EVEN_ENABLED and not be_already_done:
+                        try:
+                            # ── KEY CHANGE: read from MARK_PRICES cache (WS),
+                            #    fall back to REST only if WS hasn't sent yet ──
+                            with MARK_PRICES_LOCK:
+                                live_price = MARK_PRICES.get(symbol)
+ 
+                            if live_price is None:
+                                # WS not ready yet — REST fallback (rare, startup only)
+                                ticker_be = make_api_request('GET', f'/tickers/{symbol}')
+                                if ticker_be and ticker_be.get('result'):
+                                    live_price = float(ticker_be['result']['mark_price']
+                                                       or ticker_be['result']['close'])
+                                    # Prime the cache while we're here
+                                    with MARK_PRICES_LOCK:
+                                        MARK_PRICES[symbol] = live_price
+                                    log_system(f"[BE] WS mark price not ready, used REST fallback for {symbol}")
+ 
+                            if live_price is not None:
+                                if size > 0:  # LONG
+                                    tp_distance  = expected_tp - entry
+                                    half_distance = tp_distance * BREAK_EVEN_TRIGGER_PERCENT
+                                    be_trigger   = entry + half_distance - BREAK_EVEN_TRIGGER_BUFFER
+                                    be_new_sl    = entry + BREAK_EVEN_PROFIT_OFFSET
+ 
+                                    if live_price >= be_trigger:
+                                        _set_break_even_sl(
+                                            symbol, product_id, size,
+                                            be_new_sl, pos_key,
+                                            direction='long',
+                                            live_price=live_price,
+                                            be_trigger=be_trigger
+                                        )
+ 
+                                else:  # SHORT
+                                    tp_distance   = entry - expected_tp
+                                    half_distance  = tp_distance * BREAK_EVEN_TRIGGER_PERCENT
+                                    be_trigger     = entry - half_distance + BREAK_EVEN_TRIGGER_BUFFER
+                                    be_new_sl      = entry - BREAK_EVEN_PROFIT_OFFSET
+ 
+                                    if live_price <= be_trigger:
+                                        _set_break_even_sl(
+                                            symbol, product_id, size,
+                                            be_new_sl, pos_key,
+                                            direction='short',
+                                            live_price=live_price,
+                                            be_trigger=be_trigger
+                                        )
+ 
+                        except Exception as be_err:
+                            log_system(f"[BREAK-EVEN] Error for {symbol}: {be_err}")
+                    # ── END BREAK-EVEN LOGIC ──────────────────────────────
+ 
+                    # ── TP/SL existence check ─────────────────────────────
                     dynamic_tolerance = entry * 0.0005
-
+ 
                     orders_response = make_api_request('GET', f'/orders?product_id={product_id}&state=open')
                     if not orders_response or not orders_response.get('success'):
                         continue
-
+ 
                     orders    = orders_response.get("result", [])
                     tp_orders = [o for o in orders if o.get("reduce_only") and o.get("stop_order_type") == "take_profit_order"]
                     sl_orders = [o for o in orders if o.get("reduce_only") and o.get("stop_order_type") == "stop_loss_order"]
-
+ 
                     tp_valid        = False
                     sl_valid        = False
                     wrong_tp_orders = []
                     wrong_sl_orders = []
-
+ 
                     for tp_order in tp_orders:
                         stop_price = float(tp_order.get("stop_price", 0))
                         if abs(stop_price - expected_tp) < dynamic_tolerance:
                             tp_valid = True
                         else:
                             wrong_tp_orders.append(tp_order)
-
+ 
                     for sl_order in sl_orders:
                         stop_price = float(sl_order.get("stop_price", 0))
                         if abs(stop_price - final_sl) < dynamic_tolerance:
                             sl_valid = True
                         else:
                             wrong_sl_orders.append(sl_order)
-
+ 
                     tp_edited = False
                     sl_edited = False
-
+ 
                     if wrong_tp_orders and not tp_valid:
                         for tp_order in wrong_tp_orders:
                             order_id     = tp_order.get("id")
@@ -3838,9 +3970,9 @@ def auto_tp_sl_guardian():
                                     log_system(f"TP EDITED")
                                     tp_edited = True
                                     break
-                            except:
+                            except Exception:
                                 pass
-
+ 
                     if wrong_sl_orders and not sl_valid:
                         for sl_order in wrong_sl_orders:
                             order_id     = sl_order.get("id")
@@ -3864,17 +3996,24 @@ def auto_tp_sl_guardian():
                                     log_system(f"SL EDITED")
                                     sl_edited = True
                                     break
-                            except:
+                            except Exception:
                                 pass
-
+ 
                     need_tp = not tp_valid and not tp_edited
                     need_sl = not sl_valid and not sl_edited
-
+ 
                     if need_tp or need_sl:
-                        ticker = make_api_request('GET', f'/tickers/{symbol}')
-                        if ticker:
-                            curr_price = float(ticker['result']['close'])
-                            is_safe    = True
+                        # Use cached mark price for safety check too
+                        with MARK_PRICES_LOCK:
+                            curr_price = MARK_PRICES.get(symbol)
+                        if curr_price is None:
+                            ticker = make_api_request('GET', f'/tickers/{symbol}')
+                            if ticker and ticker.get('result'):
+                                curr_price = float(ticker['result']['mark_price']
+                                                   or ticker['result']['close'])
+ 
+                        if curr_price is not None:
+                            is_safe = True
                             if size > 0:
                                 if expected_tp <= curr_price or final_sl >= curr_price:
                                     is_safe = False
@@ -3883,7 +4022,7 @@ def auto_tp_sl_guardian():
                                     is_safe = False
                             if not is_safe:
                                 continue
-
+ 
                         log_system(f"Placing missing TP/SL for {symbol}")
                         payload = {
                             "product_id": int(product_id),
@@ -3906,17 +4045,90 @@ def auto_tp_sl_guardian():
                             )
                             if res.status_code == 200:
                                 log_system(f"Bracket placed for {symbol}")
-                        except:
+                        except Exception:
                             pass
-
+ 
                     time.sleep(0.3)
-
-                except Exception as e:
+ 
+                except Exception:
                     pass
-
-        except Exception as e:
+ 
+        except Exception:
             time.sleep(2)
-
+ 
+ 
+def _set_break_even_sl(symbol, product_id, size, be_new_sl, pos_key,
+                        direction, live_price, be_trigger):
+    """
+    Helper: edit existing SL order to break-even level, or place new bracket SL.
+    Sets _break_even_applied[pos_key] = True on success.
+    """
+    orders_be    = make_api_request('GET', f'/orders?product_id={product_id}&state=open')
+    sl_orders_be = []
+    if orders_be and orders_be.get('success'):
+        sl_orders_be = [
+            o for o in orders_be.get("result", [])
+            if o.get("reduce_only") and o.get("stop_order_type") == "stop_loss_order"
+        ]
+ 
+    be_sl_set = False
+ 
+    for sl_o in sl_orders_be:
+        order_id_be  = sl_o.get("id")
+        edit_payload = {
+            "id":         order_id_be,
+            "product_id": int(product_id),
+            "order_type": "market_order",
+            "stop_price": "{:.6f}".format(be_new_sl),
+            "size":       abs(int(size))
+        }
+        edit_body = json.dumps(edit_payload)
+        try:
+            edit_res = requests.put(
+                BASE_URL + "/v2/orders",
+                headers=sign_request("PUT", "/v2/orders", edit_body),
+                data=edit_body,
+                timeout=10
+            )
+            if edit_res.status_code == 200:
+                log_system(
+                    f"[BREAK-EVEN] {direction.upper()} {symbol}: "
+                    f"live={live_price:.6f} vs trigger={be_trigger:.6f} -> "
+                    f"SL moved to {be_new_sl:.6f}"
+                )
+                with _break_even_applied_lock:
+                    _break_even_applied[pos_key] = True
+                be_sl_set = True
+                break
+        except Exception:
+            pass
+ 
+    if not be_sl_set and not sl_orders_be:
+        # No existing SL order — place fresh bracket SL
+        payload_be = {
+            "product_id": int(product_id),
+            "stop_loss_order": {
+                "order_type": "market_order",
+                "stop_price": "{:.6f}".format(be_new_sl)
+            }
+        }
+        body_be = json.dumps(payload_be)
+        try:
+            res_be = requests.post(
+                BASE_URL + "/v2/orders/bracket",
+                headers=sign_request("POST", "/v2/orders/bracket", body_be),
+                data=body_be,
+                timeout=10
+            )
+            if res_be.status_code == 200:
+                log_system(
+                    f"[BREAK-EVEN] {direction.upper()} {symbol}: "
+                    f"New SL placed at {be_new_sl:.6f}"
+                )
+                with _break_even_applied_lock:
+                    _break_even_applied[pos_key] = True
+        except Exception:
+            pass
 
 # ========== MAIN ==========
 if __name__ == '__main__':
